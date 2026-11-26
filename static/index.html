@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#171e2c">
+<title>月账 · 个人账单分析</title>
+<link rel="stylesheet" href="/styles.css">
+<script src="/main.js" defer></script>
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="#overview"><span class="brand-icon">▥</span><span>月账<small>个人账单分析</small></span></a>
+  <nav aria-label="主导航">
+    <a href="#overview"><span>◫</span>月度总览</a>
+    <a href="#trends"><span>↗</span>趋势与对比</a>
+    <a href="#import"><span>⇧</span>导入与核对</a>
+    <a href="#review"><span>◇</span>复盘与规则</a>
+  </nav>
+  <div class="local"><i></i> 本地数据存储</div>
+</aside>
+<div class="workspace">
+  <header class="topbar"><span id="breadcrumb">账单分析</span><a class="button primary" href="#import">＋ 导入账单</a></header>
+  <main id="main" aria-busy="true"><p>正在加载账单…</p></main>
+</div>
+<div id="toast" role="status" hidden></div>
+<dialog id="detail"></dialog>
+</body>
+</html>
