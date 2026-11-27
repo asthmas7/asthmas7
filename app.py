@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from boc_statement import parse_boc
 from openai_client import OpenAIConfigurationError, OpenAIResponseError, configured
 from statement_ai import analysis_snapshot, analyze, extract_pdf
+from spending_review import review_candidates
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("BILL_DATA_DIR", ROOT / "data"))
@@ -376,7 +377,8 @@ class AnalysisRequest(BaseModel):
 def load_analysis(query):
     with database() as db:
         rows = [dict(row) for row in db.execute(
-            "SELECT day,card,merchant,amount,kind,category,tag FROM transactions WHERE sample=0 ORDER BY day,id")]
+            "SELECT t.id,t.day,t.card,t.merchant,t.amount,t.kind,t.category,t.tag,r.purchase AS original_id "
+            "FROM transactions t LEFT JOIN refund_links r ON r.refund=t.id WHERE t.sample=0 ORDER BY t.day,t.id")]
         if not any(row["day"][:7] == query.month for row in rows):
             raise HTTPException(404, "所选月份没有已入账的真实账单。")
         snapshot = analysis_snapshot(rows, query.month, query.comparison)
@@ -386,30 +388,40 @@ def load_analysis(query):
 
 
 @app.get("/api/analysis")
-def saved_analysis(month: str, comparison: str):
+def saved_analysis(month: str, comparison: str, sample: bool = False):
     try:
         query = AnalysisRequest(month=month, comparison=comparison)
     except ValueError as error:
         raise HTTPException(422, "请选择有效的月份。") from error
-    _, _, result = load_analysis(query)
-    return {"analysis": result}
+    if sample:
+        with database() as db:
+            seed(db)
+            rows = [dict(row) for row in db.execute(
+                "SELECT id,day,card,merchant,amount,kind,category,tag FROM transactions WHERE sample=1")]
+        return {"analysis": None, "candidates": review_candidates(rows, query.month)}
+    snapshot, _, result = load_analysis(query)
+    return {"analysis": result, "candidates": snapshot["待复盘交易"]}
 
 
 @app.post("/api/analysis")
 def generate_analysis(query: AnalysisRequest):
     snapshot, fingerprint, cached = load_analysis(query)
     if cached is not None:
-        return {"analysis": cached}
+        return {"analysis": cached, "candidates": snapshot["待复盘交易"]}
     if not configured():
         raise HTTPException(503, "请配置 OPENAI_API_KEY 后开启 AI 分析。")
     try:
         result = analyze(snapshot).model_dump()
     except AI_ERRORS as error:
         raise HTTPException(502, "AI 分析暂不可用，请检查 API 配置或稍后重试。") from error
+    valid_ids = {candidate["交易编号"] for candidate in snapshot["待复盘交易"]}
+    suggestions = {item["transaction_id"]: item for item in reversed(result["transaction_review"])
+                   if item["transaction_id"] in valid_ids}
+    result["transaction_review"] = list(suggestions.values())
     with database() as db:
         db.execute("INSERT OR IGNORE INTO ai_analyses VALUES(?,?)",
                    (fingerprint, json.dumps(result, ensure_ascii=False)))
-    return {"analysis": result}
+    return {"analysis": result, "candidates": snapshot["待复盘交易"]}
 
 
 def analyze_import(months):
@@ -437,7 +449,7 @@ def batch_pdf(batch_id: int):
 
 class Feedback(BaseModel):
     category: str
-    tag: Literal["", "可减少", "疑似浪费"]
+    tag: Literal["", "可减少", "疑似浪费", "合理支出"]
     note: str = Field(max_length=2000)
     learn: bool = False
 
@@ -480,6 +492,11 @@ def example_pdf(card_type: Literal["借记卡", "信用卡"] = "信用卡"):
             page.insert_text((55, 65 + index * 28), line, fontsize=12)
         return Response(document.tobytes(), media_type="application/pdf",
                         headers={"Content-Disposition": 'attachment; filename="sample-statement.pdf"'})
+
+
+@app.get("/.well-known/appspecific/com.chrome.devtools.json", include_in_schema=False)
+def chrome_devtools_discovery():
+    return {}
 
 
 app.mount("/", StaticFiles(directory=ROOT / "static", html=True), name="web")

@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from openai_client import generate_structured
+from spending_review import review_candidates
 
 
 class StrictModel(BaseModel):
@@ -77,11 +78,11 @@ def monthly(rows):
         if row["kind"] in {"消费", "退款"}:
             by_category[row["category"]] += net(row)
         by_kind[row["kind"]] += row["amount"]
-        if row["tag"]:
+        if row["tag"] in {"可减少", "疑似浪费"}:
             by_tag[row["tag"]] += net(row)
     return {"笔数": len(rows), "消费净额_分": sum(map(net, rows)),
             "分类消费净额_分": dict(by_category), "分类型金额_分": dict(by_kind),
-            "复盘标记净额_分": dict(by_tag), "复盘标记笔数": sum(bool(row["tag"]) for row in rows)}
+            "复盘标记净额_分": dict(by_tag), "复盘标记笔数": sum(row["tag"] in {"可减少", "疑似浪费"} for row in rows)}
 
 
 def analysis_snapshot(rows, month, comparison):
@@ -106,6 +107,7 @@ def analysis_snapshot(rows, month, comparison):
         a, b = (period["分类消费净额_分"] for period in (month_summary, comparison_summary))
         category_delta = {key: a.get(key, 0) - b.get(key, 0) for key in sorted(a.keys() | b.keys())}
     return {
+        "待复盘交易": review_candidates(rows, month),
         "目标月": month, "对比月": comparison, "目标月汇总": month_summary, "对比月汇总": comparison_summary,
         "分类变化_分": category_delta,
         "月度趋势_分": {key: value["消费净额_分"] for key, value in periods.items()},
@@ -117,12 +119,19 @@ def analysis_snapshot(rows, month, comparison):
     }
 
 
+class TransactionReview(StrictModel):
+    transaction_id: int
+    reason: str
+    action: str
+
+
 class Analysis(StrictModel):
     summary: str
     categories: list[str]
     trends: list[str]
     anomalies: list[str]
     review: list[str]
+    transaction_review: list[TransactionReview]
 
 
 def analyze(snapshot):
@@ -134,7 +143,9 @@ def analyze(snapshot):
             "trends 说明月度对比与年度覆盖，缺月和 null 都表示无账单，不能当零。"
             "anomalies 解释可核对的波动和疑似重复；review 给出可行动的复盘建议。"
             "用户的复盘标记和重复迹象都不是浪费的结论，不要自行判定某笔交易是不当消费。"
-            "每个数组最多输出三条简短建议，缺乏依据时留空。不要推测匿名商户是谁。"
+            "transaction_review 针对待复盘交易中依据最充分的最多三笔，原样返回交易编号，"
+            "reason 说明这笔为何值得看，action 给出可执行的核对步骤，例如核对同日订单或检查是否仍使用订阅。"
+            "只引用候选提供的证据，禁止虚构其他交易。每个数组最多输出三条，缺乏依据时留空。不要推测匿名商户是谁。"
         ),
         schema=Analysis,
     )

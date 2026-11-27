@@ -42,7 +42,7 @@ class StatementAiTest(unittest.TestCase):
             {"day": "2026-10-16", "merchant": "无效页", "amount_cents": 10,
              "kind": "消费", "page": 2, "excerpt": ""},
         ], "warnings": []})
-        report = Analysis(summary="本月概况", categories=[], trends=[], anomalies=[], review=[])
+        report = Analysis(summary="本月概况", categories=[], trends=[], anomalies=[], review=[], transaction_review=[])
         with (patch.object(app, "configured", return_value=True),
               patch("statement_ai.generate_structured", side_effect=[extraction, report]) as api):
             preview = self.preview().json()

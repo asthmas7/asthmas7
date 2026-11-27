@@ -23,6 +23,7 @@ let store = {transactions: [], categories: [], batches: [], rules: []};
 let month, comparison, toastTimer;
 let card = "", category = "", pending = [], scope;
 let revision = 0;
+const markedForReview = row => ["可减少", "疑似浪费"].includes(row.tag);
 
 async function request(url, init) {
   const response = await fetch(url, init);
@@ -161,35 +162,65 @@ function sampleBanner() {
 }
 
 const analysisStates = new Map();
-const analysisKey = (period, baseline) => period + "/" + baseline;
+const analysisKey = (period, baseline, sample) => [period, baseline, sample].join("/");
+const sampleAnalysis = () => scope === "sample" ||
+  (scope === "all" && !store.transactions.some(row => !row.sample));
 
 function selectedAnalysis() {
   return [month, view() === "trends" ? comparison : shiftMonth(month, -1)];
 }
 
+function transactionReview(candidates, result, loaded) {
+  if (!loaded) return "";
+  if (!candidates.length) return '<p class="muted">本月暂无有足够依据的待复盘交易。</p>';
+  const suggestions = new Map((result?.transaction_review ?? []).map(item => [item.transaction_id, item]));
+  const transactions = new Map(store.transactions.map(row => [row.id, row]));
+  return `<div class="stack"><h3>优先核对的交易</h3>${candidates.map(candidate => {
+    const row = transactions.get(candidate["交易编号"]);
+    if (!row) return "";
+    const suggestion = suggestions.get(row.id);
+    const evidence = candidate["依据"].map(reason => ({
+      "疑似重复": `同日同卡同商户同金额共 ${reason["同日同卡同商户同额笔数"]} 笔，可核对订单记录。`,
+      "历史反馈": `近六个月这家商户有 ${reason["标记可减少或疑似浪费的笔数"]} 笔被你标记为可减少或疑似浪费，
+        ${reason["合理支出笔数"]} 笔标为合理。`,
+      "疑似周期扣费": `过去六个月有 ${reason["过去六个月相同金额出现月数"]} 个月在该商户出现同额扣费，可检查是否仍使用。`,
+      "金额明显高于以往": `该商户历史单笔中位数为 ${money(reason["历史同商户单笔中位数_分"] ?? 0)}，可检查是否为一次性支出。`,
+    })[reason["类型"]]).filter(Boolean);
+    return `<article class="hint-row">
+      <div class="between"><div><strong>${esc(row.merchant)} · ${money(row.amount)}</strong>
+      <small> · ${esc(row.day)} · ${esc(row.category)}</small></div>
+      <button class="button small" data-detail="${row.id}">核对并反馈</button></div>
+      ${evidence.map(line => `<p class="muted">${esc(line)}</p>`).join("")}
+      ${suggestion ? `<p>AI 建议：${esc(suggestion.reason)} ${esc(suggestion.action)}</p>` : ""}</article>`;
+  }).join("")}</div>`;
+}
+
 function analysisPanel(period, baseline) {
-  const exists = store.transactions.some(row => !row.sample && row.day.startsWith(period));
-  if (!exists || scope === "sample") return "";
-  const status = analysisStates.get(analysisKey(period, baseline));
+  const sample = sampleAnalysis();
+  const exists = store.transactions.some(row => Boolean(row.sample) === sample && row.day.startsWith(period));
+  if (!exists) return "";
+  const status = analysisStates.get(analysisKey(period, baseline, sample));
   const result = status?.analysis;
-  const title = section("AI 账单分析",
-    `${monthTitle(period)} · 对比 ${monthTitle(baseline)} · 全部已入账卡片`,
-    !store.ai_enabled || result ? "" :
+  const title = section("支出复盘",
+    `${monthTitle(period)} · ${sample ? "演示数据" : `对比 ${monthTitle(baseline)} · 全部已入账卡片`}`,
+    sample || !store.ai_enabled || result ? "" :
       `<button class="button small" data-analyze="" ${status?.busy ? "disabled" : ""}>${status?.busy ? "分析中…" : "生成分析"}</button>`);
   const sections = result ? [
     ["消费分类", result.categories], ["月度趋势与年度汇总", result.trends],
     ["异常与疑似重复", result.anomalies], ["复盘建议", result.review],
   ] : [];
   return `<section class="panel" id="analysis-panel">${title}
+    ${transactionReview(status?.candidates ?? [], result, Boolean(status?.candidates))}
     ${result ? `<div class="stack"><p>${esc(result.summary)}</p>${sections.filter(([, values]) => values.length)
       .map(([name, values]) => `<div><h3>${name}</h3><ul>${values.map(value => `<li>${esc(value)}</li>`).join("")}</ul></div>`)
       .join("")}<small>AI 提示供核对，金额以账单和本地统计为准。</small></div>`
-    : `<p class="muted" role="status">${esc(status?.error || (status?.busy ? "正在生成账单复盘…" :
+    : sample && !status?.error ? "" : `<p class="muted" role="status">${esc(status?.error || (status?.busy ? "正在生成账单复盘…" :
       store.ai_enabled ? "分析会发送匿名汇总给 OpenAI。" : "配置 OPENAI_API_KEY 后可生成分析。"))}</p>`}</section>`;
 }
 
 async function fetchAnalysis(period, baseline, generate = false) {
-  const key = analysisKey(period, baseline);
+  const sample = sampleAnalysis();
+  const key = analysisKey(period, baseline, sample);
   if (!generate && analysisStates.has(key)) return;
   if (generate && analysisStates.get(key)?.generating) return;
   const status = {busy: generate, generating: generate};
@@ -199,8 +230,9 @@ async function fetchAnalysis(period, baseline, generate = false) {
     const query = {month:period, comparison:baseline};
     const response = generate ? await request("/api/analysis", {
       method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(query),
-    }) : await request("/api/analysis?" + new URLSearchParams(query));
+    }) : await request("/api/analysis?" + new URLSearchParams({...query, sample:String(sample)}));
     status.analysis = response.analysis;
+    status.candidates = response.candidates;
   } catch (error) {
     status.error = error.message;
   } finally {
@@ -211,13 +243,16 @@ async function fetchAnalysis(period, baseline, generate = false) {
 }
 
 async function waitForAnalysis(period, baseline) {
-  const key = analysisKey(period, baseline);
+  const key = analysisKey(period, baseline, false);
   const status = {busy:true, generating:true};
   analysisStates.set(key, status);
   try {
     for (let attempt = 0; attempt < 30 && analysisStates.get(key) === status; attempt++) {
       const query = new URLSearchParams({month:period, comparison:baseline});
-      status.analysis = (await request("/api/analysis?" + query)).analysis;
+      const response = await request("/api/analysis?" + query);
+      status.analysis = response.analysis;
+      status.candidates = response.candidates;
+      if (analysisStates.get(key) === status) updateAnalysisPanel();
       if (status.analysis) return;
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
@@ -247,7 +282,7 @@ function overview() {
   const spending = list.filter(isSpending);
   const expense = sum(list);
   const delta = expense - sum(previous ?? []);
-  const review = list.filter(row => row.tag);
+  const review = list.filter(markedForReview);
   const count = new Set(spending.map(row => row.category)).size;
   const active = category ? `<button class="button small" data-category="">清除类别筛选</button>` : "";
   return heading("月度总览", "查看支出去向，复盘每一笔花销。", filters()) + sampleBanner() +
@@ -256,12 +291,12 @@ function overview() {
       ${kpi("消费交易", "≡", "green", String(list.filter(row => row.kind === "消费").length), "仅计消费笔数")}
       ${kpi("支出类别", "◈", "purple", String(count), "当月有消费或退款的类别")}
       ${kpi("标记待复盘", "⚑", "orange", String(review.length), review.length ? `标记交易净额 ${money(sum(review))}` : "暂无标记交易")}</div>
+    ${analysisPanel(month, shiftMonth(month, -1))}
     <div class="grid">
       <section class="panel">${section("消费趋势", "最近 6 个月 · 人民币", '<a class="button small" href="#trends">查看对比 ↗</a>')}
       ${chart(Array.from({length:6}, (_, index) => shiftMonth(month, index - 5)), months)}</section>
       <section class="panel">${section("支出分类", "点击类别筛选本月交易", active)}${categoryBreakdown(spending)}</section>
     </div>
-    ${analysisPanel(month, shiftMonth(month, -1))}
     <section class="panel">${section("交易明细", `${monthTitle(month)} · ${list.length} 笔`, '<span class="pill">人民币 CNY</span>')}${table(list)}</section>
     <section class="panel">${section("主要商户", "按消费净额排序")}${topMerchants(spending)}</section>`;
 }
@@ -397,7 +432,7 @@ function reconcile(form) {
 
 function reviewPage() {
   const rows = filtered().filter(row => row.day.startsWith(month));
-  const marked = rows.filter(row => row.tag);
+  const marked = rows.filter(markedForReview);
   const counts = new Map();
   const duplicates = [];
   for (const row of rows.filter(row => row.kind === "消费")) {
@@ -448,7 +483,7 @@ function showDetail(id) {
       <br><small>${esc(row.source)}</small></p>` : ""}
     ${original ? `<button type="button" class="link" data-original="${original.id}">查看关联原消费 · ${original.day}</button>` : ""}
     <label class="field">类别<select name="category">${options(store.categories, row.category)}</select></label>
-    <label class="field">复盘标记<select name="tag"><option value="">无标记</option>${options(["可减少", "疑似浪费"], row.tag)}</select></label>
+    <label class="field">复盘标记<select name="tag"><option value="">无标记</option>${options(["可减少", "疑似浪费", "合理支出"], row.tag)}</select></label>
     <label class="field">备注<textarea name="note" maxlength="2000" rows="3">${esc(row.note)}</textarea></label>
     <label><input name="learn" type="checkbox"> 以后同名商户使用这个分类</label>
     <button class="button primary">保存反馈</button></form>`;
