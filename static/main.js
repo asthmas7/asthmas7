@@ -160,6 +160,82 @@ function sampleBanner() {
     <button class="button small" data-clear>移除演示交易</button></div>` : "";
 }
 
+const analysisStates = new Map();
+const analysisKey = (period, baseline) => period + "/" + baseline;
+
+function selectedAnalysis() {
+  return [month, view() === "trends" ? comparison : shiftMonth(month, -1)];
+}
+
+function analysisPanel(period, baseline) {
+  const exists = store.transactions.some(row => !row.sample && row.day.startsWith(period));
+  if (!exists || scope === "sample") return "";
+  const status = analysisStates.get(analysisKey(period, baseline));
+  const result = status?.analysis;
+  const title = section("AI 账单分析",
+    `${monthTitle(period)} · 对比 ${monthTitle(baseline)} · 全部已入账卡片`,
+    !store.ai_enabled || result ? "" :
+      `<button class="button small" data-analyze="" ${status?.busy ? "disabled" : ""}>${status?.busy ? "分析中…" : "生成分析"}</button>`);
+  const sections = result ? [
+    ["消费分类", result.categories], ["月度趋势与年度汇总", result.trends],
+    ["异常与疑似重复", result.anomalies], ["复盘建议", result.review],
+  ] : [];
+  return `<section class="panel" id="analysis-panel">${title}
+    ${result ? `<div class="stack"><p>${esc(result.summary)}</p>${sections.filter(([, values]) => values.length)
+      .map(([name, values]) => `<div><h3>${name}</h3><ul>${values.map(value => `<li>${esc(value)}</li>`).join("")}</ul></div>`)
+      .join("")}<small>AI 提示供核对，金额以账单和本地统计为准。</small></div>`
+    : `<p class="muted" role="status">${esc(status?.error || (status?.busy ? "正在生成账单复盘…" :
+      store.ai_enabled ? "分析会发送匿名汇总给 OpenAI。" : "配置 OPENAI_API_KEY 后可生成分析。"))}</p>`}</section>`;
+}
+
+async function fetchAnalysis(period, baseline, generate = false) {
+  const key = analysisKey(period, baseline);
+  if (!generate && analysisStates.has(key)) return;
+  if (generate && analysisStates.get(key)?.generating) return;
+  const status = {busy: generate, generating: generate};
+  analysisStates.set(key, status);
+  updateAnalysisPanel();
+  try {
+    const query = {month:period, comparison:baseline};
+    const response = generate ? await request("/api/analysis", {
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(query),
+    }) : await request("/api/analysis?" + new URLSearchParams(query));
+    status.analysis = response.analysis;
+  } catch (error) {
+    status.error = error.message;
+  } finally {
+    status.busy = false;
+    status.generating = false;
+    if (analysisStates.get(key) === status) updateAnalysisPanel();
+  }
+}
+
+async function waitForAnalysis(period, baseline) {
+  const key = analysisKey(period, baseline);
+  const status = {busy:true, generating:true};
+  analysisStates.set(key, status);
+  try {
+    for (let attempt = 0; attempt < 30 && analysisStates.get(key) === status; attempt++) {
+      const query = new URLSearchParams({month:period, comparison:baseline});
+      status.analysis = (await request("/api/analysis?" + query)).analysis;
+      if (status.analysis) return;
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    status.error = "分析尚未返回。可稍后重试。";
+  } catch (error) {
+    status.error = error.message;
+  } finally {
+    status.busy = false;
+    status.generating = false;
+    if (analysisStates.get(key) === status) updateAnalysisPanel();
+  }
+}
+
+function updateAnalysisPanel() {
+  const panel = document.querySelector("#analysis-panel");
+  if (panel) panel.outerHTML = analysisPanel(...selectedAnalysis());
+}
+
 function overview() {
   const rows = filtered();
   const coverage = store.transactions.filter(row => (!card || row.card === card) &&
@@ -185,6 +261,7 @@ function overview() {
       ${chart(Array.from({length:6}, (_, index) => shiftMonth(month, index - 5)), months)}</section>
       <section class="panel">${section("支出分类", "点击类别筛选本月交易", active)}${categoryBreakdown(spending)}</section>
     </div>
+    ${analysisPanel(month, shiftMonth(month, -1))}
     <section class="panel">${section("交易明细", `${monthTitle(month)} · ${list.length} 笔`, '<span class="pill">人民币 CNY</span>')}${table(list)}</section>
     <section class="panel">${section("主要商户", "按消费净额排序")}${topMerchants(spending)}</section>`;
 }
@@ -233,16 +310,18 @@ function trends() {
     <section class="panel">${section("年度汇总", "仅汇总已有账单月份。")}
       ${years.size ? chart([...years.keys()].sort(), years, true) : '<p class="empty">暂无年度数据。</p>'}
     </section>
+    ${analysisPanel(month, comparison)}
     <section class="panel">${section("所选月份交易", monthTitle(month))}${table(a ?? [])}</section>`;
 }
 
 function importPage() {
-  return heading("导入与核对", "上传可选中文字的 PDF，确认交易后入账。") +
+  return heading("导入与核对", "上传 PDF，确认交易后入账。") +
     `<section class="panel">${section("选择账单", "一次最多 10 份，每份不超过 10 MB。")}
       <div class="fields"><label class="field">PDF 文件<input id="pdfs" type="file" accept=".pdf,application/pdf" multiple></label>
       <a class="button" href="/api/example.pdf">信用卡样例</a>
       <a class="button" href="/api/example.pdf?card_type=借记卡">借记卡样例</a></div>
       <p class="muted">支持中国银行人民币信用卡账单，以及「日期　商户　金额　交易类型」样例格式。</p>
+      ${store.ai_enabled ? '<p class="callout">本地未识别到交易时，原始 PDF 会发送给 OpenAI 提取交易。确认入账后，系统会发送匿名汇总生成分析。</p>' : ""}
       ${pending.map(importItem).join("")}</section>
     <section class="panel">${section("导入记录", "打开原始 PDF 核对。")}
     ${store.batches.length ? store.batches.map(batch => `<div class="between hint-row">
@@ -277,7 +356,7 @@ function previewTable(item, i) {
       <td><input name="day" type="date" aria-label="交易日期" value="${row.day}"></td>
       <td><input name="merchant" type="text" aria-label="商户" maxlength="200" value="${esc(row.merchant)}"></td>
       <td><input name="amount" type="number" aria-label="金额" min="0" max="1000000000" step="0.01" value="${row.amount === null ? "" : row.amount / 100}"></td>
-      <td><select name="kind" aria-label="类型">${options(["消费", "退款", "转账", "还款"], row.kind)}</select></td>
+      <td><select name="kind" aria-label="类型">${options([...(row.kind === "待核对" ? ["待核对"] : []), "消费", "退款", "转账", "还款"], row.kind)}</select></td>
       <td><select name="category" aria-label="类别">${options(store.categories, row.category)}</select></td>
       <td title="${esc(row.source)}">${row.manual
         ? `<input name="page" type="number" min="1" max="${item.preview.page_count}" value="${row.page ?? ""}" aria-label="原始页码"> 页 · 人工补录`
@@ -355,6 +434,7 @@ function render() {
   main.innerHTML = {overview, trends, import: importPage, review: reviewPage}[current]();
   main.querySelectorAll("[data-confirm]").forEach(reconcile);
   main.setAttribute("aria-busy", "false");
+  if (main.querySelector("#analysis-panel")) void fetchAnalysis(...selectedAnalysis());
 }
 
 function showDetail(id) {
@@ -428,6 +508,7 @@ main.addEventListener("click", async event => {
   const data = button.dataset;
   try {
     if (data.detail) { showDetail(Number(data.detail)); return; }
+    if (Object.hasOwn(data, "analyze")) { void fetchAnalysis(...selectedAnalysis(), true); return; }
     if (Object.hasOwn(data, "addRow")) {
       const item = pending[Number(data.addRow)];
       item.preview.rows.push({manual:true, page:1, day:"", merchant:"", amount:null, kind:"消费", category:"其他"});
@@ -484,10 +565,15 @@ main.addEventListener("submit", async event => {
       notify("请选择至少一笔交易，并填写日期、商户和有效金额。");
       return;
     }
+    if (rows.some(row => row.kind === "待核对")) {
+      notify("请为选中的待核对交易选择收支类型。");
+      return;
+    }
     const expected = item.preview.expected;
     if ((item.preview.warnings.length || (expected !== null && sum(rows) !== expected)) &&
         !window.confirm("存在解析提示或对账差额。确认按当前选中结果入账？")) return;
-    body.append("payload", JSON.stringify({card:item.card, card_type:item.cardType, rows}));
+    body.append("payload", JSON.stringify({card:item.card, card_type:item.cardType, rows,
+      preview_token:item.preview.preview_token}));
   } else {
     item.card = form.elements.card.value.trim();
     item.cardType = form.elements.cardType.value;
@@ -501,7 +587,11 @@ main.addEventListener("submit", async event => {
     if (confirming) {
       const result = await request("/api/import", {method:"POST", body});
       item.done = result.count;
+      analysisStates.clear();
       await refresh();
+      if (store.ai_enabled) {
+        for (const period of result.months) void waitForAnalysis(period, shiftMonth(period, -1));
+      }
       const latest = store.transactions.find(row => !row.sample);
       if (latest) month = latest.day.slice(0, 7);
       scope = "real";
@@ -538,6 +628,7 @@ detail.addEventListener("submit", async event => {
       method:"PATCH", headers:{"Content-Type":"application/json"},
       body:JSON.stringify({category:category.value, tag:tag.value, note:note.value, learn:learn.checked}),
     });
+    analysisStates.clear();
     await refresh();
     detail.close();
     render();

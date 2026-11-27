@@ -1,8 +1,9 @@
-"""Explicit, opt-in text calls to the OpenAI Responses API."""
+"""Calls to the OpenAI Responses API."""
 
 import os
 
 from openai import OpenAI
+from pydantic import BaseModel
 
 DEFAULT_MODEL = "gpt-4.1-mini"
 
@@ -23,6 +24,21 @@ def generate_text(prompt: str, *, instructions: str | None = None, model: str | 
     """
     if not prompt.strip():
         raise ValueError("请输入要发送给 OpenAI 的文本。")
+    return _generate(prompt, instructions=instructions, model=model)
+
+
+def configured() -> bool:
+    return bool(os.getenv("OPENAI_API_KEY", "").strip())
+
+
+def generate_structured(content: list, *, instructions: str, schema: type[BaseModel]):
+    result = _generate([{"role": "user", "content": content}], instructions=instructions,
+                       text={"format": {"type": "json_schema", "name": schema.__name__,
+                                        "schema": schema.model_json_schema(), "strict": True}})
+    return schema.model_validate_json(result)
+
+
+def _generate(input_data, *, instructions=None, model=None, **options):
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise OpenAIConfigurationError("请在运行进程中设置 OPENAI_API_KEY。")
@@ -33,9 +49,10 @@ def generate_text(prompt: str, *, instructions: str | None = None, model: str | 
     with OpenAI(api_key=api_key, timeout=30.0, max_retries=2) as client:
         response = client.responses.create(
             model=selected_model,
-            input=prompt,
+            input=input_data,
             instructions=instructions,
             store=False,
+            **options,
         )
     if response.status != "completed" or not response.output_text.strip():
         raise OpenAIResponseError("OpenAI 未返回完整的文本结果。")

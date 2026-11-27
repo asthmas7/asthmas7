@@ -1,8 +1,10 @@
 import hashlib
+import json
 import os
 import random
 import re
 import sqlite3
+from uuid import uuid4
 from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
@@ -10,12 +12,16 @@ from pathlib import Path
 from typing import Literal
 
 import pymupdf as fitz
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from openai import OpenAIError
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from boc_statement import parse_boc
+from openai_client import OpenAIConfigurationError, OpenAIResponseError, configured
+from statement_ai import analysis_snapshot, analyze, extract_pdf
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("BILL_DATA_DIR", ROOT / "data"))
@@ -47,6 +53,11 @@ CREATE TABLE IF NOT EXISTS refund_links (
     purchase INTEGER UNIQUE REFERENCES transactions(id)
 );
 CREATE TABLE IF NOT EXISTS rules (merchant TEXT PRIMARY KEY, category TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ai_previews (
+    token TEXT PRIMARY KEY, digest TEXT NOT NULL, card TEXT NOT NULL, rows TEXT NOT NULL,
+    created TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS ai_analyses (snapshot_hash TEXT PRIMARY KEY, result TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY);
 """
 app = FastAPI(title="月账 · 个人账单分析")
@@ -133,6 +144,7 @@ def state():
                 "SELECT id,name,card,card_type,created FROM batches ORDER BY id DESC")],
             "rules": [dict(r) for r in db.execute("SELECT * FROM rules ORDER BY merchant")],
             "categories": CATEGORIES,
+            "ai_enabled": configured(),
         }
 
 
@@ -195,8 +207,7 @@ def parse_pdf(raw):
     return rows, warnings, expected, page_count
 
 
-def preview(db, raw, card):
-    rows, warnings, expected, page_count = parse_pdf(raw)
+def prepare_rows(db, rows, card):
     existing = {(r["day"], merchant_key(r["merchant"]), r["amount"], r["kind"])
                 for r in db.execute(
                     "SELECT day,merchant,amount,kind FROM transactions WHERE card=? AND sample=0", (card,))}
@@ -214,7 +225,6 @@ def preview(db, raw, card):
             matches = refund_candidates(row, purchases)
             if len(matches) == 1:
                 row["category"] = matches[0]["category"]
-    return rows, warnings, expected, page_count
 
 
 def refund_candidates(refund, purchases):
@@ -249,17 +259,48 @@ def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-@app.post("/api/preview")
-async def preview_upload(file: UploadFile = File(), card: str = Form()):
-    raw = await read_pdf(file)
+AI_ERRORS = (OpenAIError, OpenAIConfigurationError, OpenAIResponseError, ValueError)
+
+
+def preview_pdf(raw, card):
+    file_hash = digest(raw)
+    with database() as db:
+        if db.execute("SELECT 1 FROM batches WHERE digest=?", (file_hash,)).fetchone():
+            raise HTTPException(409, "这份 PDF 已导入。")
     try:
-        with database() as db:
-            if db.execute("SELECT 1 FROM batches WHERE digest=?", (digest(raw),)).fetchone():
-                raise HTTPException(409, "这份 PDF 已导入。")
-            rows, warnings, expected, page_count = preview(db, raw, card.strip())
+        rows, warnings, expected, page_count = parse_pdf(raw)
     except (ValueError, fitz.FileDataError) as error:
         raise HTTPException(400, "无法解析 PDF。 " + str(error)) from error
-    return {"rows": rows, "warnings": warnings, "expected": expected, "page_count": page_count}
+
+    token = None
+    if not rows and configured() and page_count:
+        try:
+            rows, ai_warnings = extract_pdf(raw, page_count)
+        except AI_ERRORS:
+            warnings.append("AI 解析暂不可用，请核对 API 配置、用量或稍后重试。也可人工补录。")
+        else:
+            if rows:
+                warnings = ["本地未识别到交易，以下为 AI 从原 PDF 提取的草稿。请逐笔核对金额、类型和页码。",
+                            *ai_warnings]
+                token = uuid4().hex
+                with database() as db:
+                    db.execute("DELETE FROM ai_previews WHERE created < datetime('now', '-1 day')")
+                    db.execute("INSERT INTO ai_previews(token,digest,card,rows) VALUES(?,?,?,?)",
+                               (token, file_hash, card, json.dumps(rows, ensure_ascii=False)))
+            else:
+                warnings += ["AI 也未识别到可用交易。", *ai_warnings]
+
+    with database() as db:
+        prepare_rows(db, rows, card)
+    return {"rows": rows, "warnings": warnings, "expected": expected, "page_count": page_count,
+            "preview_token": token}
+
+
+@app.post("/api/preview")
+async def preview_upload(file: UploadFile = File(), card: str = Form(min_length=1, max_length=80)):
+    if not card.strip():
+        raise HTTPException(400, "请输入卡片别名。")
+    return await run_in_threadpool(preview_pdf, await read_pdf(file), card.strip())
 
 
 class Row(BaseModel):
@@ -276,10 +317,11 @@ class Import(BaseModel):
     card: str = Field(min_length=1, max_length=80)
     card_type: Literal["借记卡", "信用卡"]
     rows: list[Row] = Field(min_length=1, max_length=10000)
+    preview_token: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
 @app.post("/api/import")
-async def import_upload(file: UploadFile = File(), payload: str = Form()):
+async def import_upload(background: BackgroundTasks, file: UploadFile = File(), payload: str = Form()):
     raw = await read_pdf(file)
     try:
         batch = Import.model_validate_json(payload)
@@ -287,6 +329,15 @@ async def import_upload(file: UploadFile = File(), payload: str = Form()):
                                          for row in batch.rows):
             raise ValueError()
         originals, _, _, page_count = parse_pdf(raw)
+        if batch.preview_token:
+            with database() as db:
+                cached = db.execute(
+                    "SELECT rows FROM ai_previews WHERE token=? AND digest=? AND card=? "
+                    "AND created >= datetime('now', '-1 day')",
+                    (batch.preview_token, digest(raw), batch.card.strip())).fetchone()
+            if cached is None:
+                raise HTTPException(400, "AI 预览已失效，或文件与卡片已更换。请重新解析。")
+            originals = json.loads(cached["rows"])
         indices = [row.index for row in batch.rows if row.index is not None]
         if len(set(indices)) != len(indices) or any(index >= len(originals) for index in indices):
             raise ValueError()
@@ -308,9 +359,70 @@ async def import_upload(file: UploadFile = File(), payload: str = Form()):
                   "人工补录" if row.index is None else originals[row.index]["source"]) for row in batch.rows],
             )
             link_refunds(db, batch_id, batch.card.strip())
+            db.execute("DELETE FROM ai_previews WHERE digest=?", (digest(raw),))
     except sqlite3.IntegrityError as error:
         raise HTTPException(409, "这份 PDF 已导入。") from error
-    return {"count": len(batch.rows)}
+    months = sorted({row.day.isoformat()[:7] for row in batch.rows}, reverse=True)
+    if configured():
+        background.add_task(analyze_import, months)
+    return {"count": len(batch.rows), "months": months}
+
+
+class AnalysisRequest(BaseModel):
+    month: str = Field(pattern=r"^[0-9]{4}-(0[1-9]|1[0-2])$")
+    comparison: str = Field(pattern=r"^[0-9]{4}-(0[1-9]|1[0-2])$")
+
+
+def load_analysis(query):
+    with database() as db:
+        rows = [dict(row) for row in db.execute(
+            "SELECT day,card,merchant,amount,kind,category,tag FROM transactions WHERE sample=0 ORDER BY day,id")]
+        if not any(row["day"][:7] == query.month for row in rows):
+            raise HTTPException(404, "所选月份没有已入账的真实账单。")
+        snapshot = analysis_snapshot(rows, query.month, query.comparison)
+        fingerprint = digest(json.dumps(snapshot, sort_keys=True).encode())
+        cached = db.execute("SELECT result FROM ai_analyses WHERE snapshot_hash=?", (fingerprint,)).fetchone()
+    return snapshot, fingerprint, json.loads(cached["result"]) if cached else None
+
+
+@app.get("/api/analysis")
+def saved_analysis(month: str, comparison: str):
+    try:
+        query = AnalysisRequest(month=month, comparison=comparison)
+    except ValueError as error:
+        raise HTTPException(422, "请选择有效的月份。") from error
+    _, _, result = load_analysis(query)
+    return {"analysis": result}
+
+
+@app.post("/api/analysis")
+def generate_analysis(query: AnalysisRequest):
+    snapshot, fingerprint, cached = load_analysis(query)
+    if cached is not None:
+        return {"analysis": cached}
+    if not configured():
+        raise HTTPException(503, "请配置 OPENAI_API_KEY 后开启 AI 分析。")
+    try:
+        result = analyze(snapshot).model_dump()
+    except AI_ERRORS as error:
+        raise HTTPException(502, "AI 分析暂不可用，请检查 API 配置或稍后重试。") from error
+    with database() as db:
+        db.execute("INSERT OR IGNORE INTO ai_analyses VALUES(?,?)",
+                   (fingerprint, json.dumps(result, ensure_ascii=False)))
+    return {"analysis": result}
+
+
+def analyze_import(months):
+    for period in months:
+        year, month = map(int, period.split("-"))
+        if year == 1 and month == 1:
+            continue
+        previous = f"{year - 1:04d}-12" if month == 1 else f"{year:04d}-{month - 1:02d}"
+        try:
+            generate_analysis(AnalysisRequest(month=period, comparison=previous))
+        except HTTPException:
+            # The import is already committed. Users can retry analysis from the dashboard.
+            continue
 
 
 @app.get("/api/batches/{batch_id}/pdf")
