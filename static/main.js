@@ -242,7 +242,7 @@ function importPage() {
       <div class="fields"><label class="field">PDF 文件<input id="pdfs" type="file" accept=".pdf,application/pdf" multiple></label>
       <a class="button" href="/api/example.pdf">信用卡样例</a>
       <a class="button" href="/api/example.pdf?card_type=借记卡">借记卡样例</a></div>
-      <p class="muted">样例格式为「日期　商户　金额　交易类型」。不同银行版式可能需要适配。</p>
+      <p class="muted">支持中国银行人民币信用卡账单，以及「日期　商户　金额　交易类型」样例格式。</p>
       ${pending.map(importItem).join("")}</section>
     <section class="panel">${section("导入记录", "打开原始 PDF 核对。")}
     ${store.batches.length ? store.batches.map(batch => `<div class="between hint-row">

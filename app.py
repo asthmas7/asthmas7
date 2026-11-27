@@ -15,6 +15,8 @@ from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from boc_statement import parse_boc
+
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("BILL_DATA_DIR", ROOT / "data"))
 CATEGORIES = ["餐饮美食", "交通出行", "生活购物", "居住缴费", "休闲娱乐", "医疗健康", "其他"]
@@ -159,6 +161,13 @@ def parse_pdf(raw):
         page_count = len(document)
         if page_count > 100:
             raise ValueError("每份 PDF 最多支持 100 页。")
+        if page_count:
+            boc = parse_boc(document)
+            if boc is not None:
+                rows, warnings, expected = boc
+                if not rows:
+                    warnings.insert(0, "没有识别到中国银行账单交易，请核对账单明细。")
+                return rows, warnings, expected, page_count
         for page in document:
             for source in page.get_text().splitlines():
                 source = " ".join(source.split())
